@@ -1,0 +1,79 @@
+#include <SoftwareSerial.h>
+#include <Servo.h>
+
+#define BT_RX 11
+#define BT_TX 10
+SoftwareSerial BT(BT_RX, BT_TX);
+
+Servo s;
+#define SERVO_PIN 9
+
+// ===== TUNING =====
+const int ORIGIN_POS = 90;
+const int MIN_POS = 0;
+const int MAX_POS = 180;
+
+const int STEP_DEG = 2;          // degrees per tick (1-5 feels good)
+const unsigned long INTERVAL_MS = 10; // lower = faster movement
+// ==================
+
+bool upHeld = false;
+bool downHeld = false;
+
+int pos = ORIGIN_POS;
+unsigned long lastStepMs = 0;
+
+void clampAndWrite() {
+  if (pos < MIN_POS) pos = MIN_POS;
+  if (pos > MAX_POS) pos = MAX_POS;
+  s.write(pos);
+}
+
+void handleCmd(const String& line) {
+  if (line == "U1") { upHeld = true;  Serial.println("UP HELD = 1"); }
+  else if (line == "U0") { upHeld = false; Serial.println("UP HELD = 0"); }
+  else if (line == "D1") { downHeld = true; Serial.println("DOWN HELD = 1"); }
+  else if (line == "D0") { downHeld = false; Serial.println("DOWN HELD = 0"); }
+  else if (line == "O")  { pos = ORIGIN_POS; clampAndWrite(); Serial.println("ORIGIN"); }
+  else {
+    Serial.print("Unknown: ");
+    Serial.println(line);
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  BT.begin(9600);
+
+  s.attach(SERVO_PIN);
+  s.write(pos);
+
+  Serial.println("Nano ready: hold-to-move servo");
+}
+
+void loop() {
+  // Read complete commands (newline-terminated)
+  if (BT.available()) {
+    String line = BT.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) {
+      Serial.print("Received: ");
+      Serial.println(line);
+      handleCmd(line);
+    }
+  }
+
+  // Move servo while held
+  unsigned long now = millis();
+  if (now - lastStepMs >= INTERVAL_MS) {
+    lastStepMs = now;
+
+    if (upHeld && !downHeld) {
+      pos += STEP_DEG;
+      clampAndWrite();
+    } else if (downHeld && !upHeld) {
+      pos -= STEP_DEG;
+      clampAndWrite();
+    }
+  }
+}
