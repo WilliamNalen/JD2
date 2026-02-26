@@ -1,0 +1,391 @@
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <SPI.h>
+#include <SoftwareSerial.h>
+#include <Keypad.h>
+
+// ===== TFT =====
+#define TFT_CS   7
+#define TFT_DC   5
+#define TFT_RST  6
+Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
+
+// ===== Bluetooth (Mega <-> HC-05) =====
+SoftwareSerial BT(10, 11);   // Mega RX=10 (HC-05 TX), TX=11 (HC-05 RX)
+#define BT_STATE 12
+
+// ===== Buttons =====
+#define BTN_ORIGIN 30
+#define BTN_UP     31
+#define BTN_DOWN   33
+#define BTN_RIGHT  32
+#define BTN_LEFT   34
+#define BTN_MODE   35
+
+// ===== Keypad (4x4) =====
+const byte ROWS = 4;
+const byte COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+// ✅ Your pin format:
+byte rowPins[ROWS] = {22, 23, 24, 25};
+byte colPins[COLS] = {26, 27, 28, 29};
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// ===== UI State =====
+enum Mode { MODE_BUTTONS, MODE_KEYPAD };
+Mode mode = MODE_BUTTONS;
+
+int xPos = 0;   // from Nano
+int yPos = 0;   // from Nano
+const char* opStatus = "Normal";
+
+// Multi-line G-code buffer
+String gcode = "";
+String lastGcodeDrawn = "__init";
+
+// Track last states
+int lastBtConn = -1;
+int lastOrigin=-1, lastUp=-1, lastDown=-1, lastRight=-1, lastLeft=-1;
+int lastModeBtn = 0;
+Mode lastMode = (Mode)99;
+
+int sentUpHeld = 0;
+int sentDownHeld = 0;
+int sentRightHeld = 0;
+int sentLeftHeld = 0;
+
+// ===== Layout (rotation(4) 320x240) =====
+const int W = 320;
+const int STATUS_H = 22;
+const int PAD = 8;
+
+const int LINE_H = 24;
+const int LABEL_X = 10;
+const int VAL_X   = 220;
+
+const int BTN_Y0 = STATUS_H + 42;
+
+// Keypad textbox (multi-line)
+const int BOX_X = 10;
+const int BOX_Y = STATUS_H + 45;
+const int BOX_W = 180;
+const int BOX_H = 170;
+
+// wrapping settings (for textSize(2))
+const int CHAR_W = 12;
+const int CHAR_H = 16;
+const int BOX_PAD_X = 6;
+const int BOX_PAD_Y = 6;
+const int BOX_COLS = (BOX_W - 2*BOX_PAD_X) / CHAR_W;
+const int BOX_ROWS = (BOX_H - 2*BOX_PAD_Y) / (CHAR_H + 4);
+
+// ===== BT receive buffer =====
+String btInLine = "";
+
+// ---------- BT send ----------
+void btSendLine(const char* s) {
+  BT.println(s);
+  Serial.print("BT>> ");
+  Serial.println(s);
+}
+
+// ---------- Drawing ----------
+void clearAllBlack() { tft.fillScreen(ILI9341_BLACK); }
+
+void drawStatusBar(bool force=false) {
+  int btConn = (digitalRead(BT_STATE) == HIGH) ? 1 : 0;
+  if (!force && btConn == lastBtConn) return;
+  lastBtConn = btConn;
+
+  tft.fillRect(0, 0, W, STATUS_H, ILI9341_BLACK);
+
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_WHITE);
+
+  tft.setCursor(PAD, 6);
+  tft.print("X:");
+  tft.print(xPos);
+  tft.print(" Y:");
+  tft.print(yPos);
+
+  tft.setCursor(110, 6);
+  tft.print("BT:");
+  tft.setTextColor(btConn ? ILI9341_GREEN : ILI9341_RED);
+  tft.print(btConn ? "ON" : "OFF");
+  tft.setTextColor(ILI9341_WHITE);
+
+  tft.setCursor(170, 6);
+  tft.print("OP:");
+  tft.print(opStatus);
+}
+
+void drawModeHeader(const char* text) {
+  tft.fillRect(0, STATUS_H, W, 30, ILI9341_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(PAD, STATUS_H + 8);
+  tft.print(text);
+}
+
+void drawButtonLine(int idx, const char* label) {
+  int y = BTN_Y0 + idx * LINE_H;
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE);
+
+  tft.setCursor(LABEL_X, y);
+  tft.print(label);
+
+  tft.setCursor(VAL_X - 18, y);
+  tft.print("[ ]");
+}
+
+void draw01AtLine(int idx, int v) {
+  int y = BTN_Y0 + idx * LINE_H;
+  tft.fillRect(VAL_X - 8, y - 2, 14, 18, ILI9341_BLACK);
+
+  tft.setTextSize(2);
+  tft.setCursor(VAL_X - 8, y);
+  tft.setTextColor(v ? ILI9341_GREEN : ILI9341_RED);
+  tft.print(v);
+  tft.setTextColor(ILI9341_WHITE);
+}
+
+void drawPressedLabel(const char* txt) {
+  int y = BTN_Y0 + 6 * LINE_H + 2;
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE);
+
+  tft.setCursor(LABEL_X, y);
+  tft.print("Pressed:");
+
+  tft.fillRect(130, y - 2, W - 130, 20, ILI9341_BLACK);
+  tft.setCursor(130, y);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.print(txt);
+  tft.setTextColor(ILI9341_WHITE);
+}
+
+void drawButtonsScreen() {
+  clearAllBlack();
+  drawStatusBar(true);
+  drawModeHeader("MODE: BUTTONS");
+
+  drawButtonLine(0, "P30 ORIGIN");
+  drawButtonLine(1, "P31 UP (X+)");
+  drawButtonLine(2, "P33 DOWN (X-)");
+  drawButtonLine(3, "P32 RIGHT (Y+)");
+  drawButtonLine(4, "P34 LEFT (Y-)");
+  drawButtonLine(5, "P35 TOGGLE");
+
+  lastOrigin = lastUp = lastDown = lastRight = lastLeft = -1;
+  drawPressedLabel("NONE");
+}
+
+void drawKeypadScreen() {
+  clearAllBlack();
+  drawStatusBar(true);
+  drawModeHeader("MODE: KEYPAD");
+
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(PAD, STATUS_H + 32);
+  tft.print("D=clear  #=newline  A=G:");
+
+  tft.drawRect(BOX_X, BOX_Y, BOX_W, BOX_H, ILI9341_WHITE);
+  lastGcodeDrawn = "__force__";
+}
+
+void drawGcodeBoxIfChanged() {
+  if (gcode == lastGcodeDrawn) return;
+
+  tft.fillRect(BOX_X + 2, BOX_Y + 2, BOX_W - 4, BOX_H - 4, ILI9341_BLACK);
+
+  String lines[32];
+  int lineCount = 0;
+
+  String cur = "";
+  for (int i = 0; i < (int)gcode.length(); i++) {
+    char c = gcode[i];
+
+    if (c == '\n') {
+      lines[lineCount++] = cur;
+      cur = "";
+      if (lineCount >= 32) break;
+      continue;
+    }
+
+    cur += c;
+    if ((int)cur.length() >= BOX_COLS) {
+      lines[lineCount++] = cur;
+      cur = "";
+      if (lineCount >= 32) break;
+    }
+  }
+  if (lineCount < 32) lines[lineCount++] = cur;
+
+  int start = 0;
+  if (lineCount > BOX_ROWS) start = lineCount - BOX_ROWS;
+
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_YELLOW);
+
+  int y = BOX_Y + BOX_PAD_Y;
+  for (int i = start; i < lineCount; i++) {
+    tft.setCursor(BOX_X + BOX_PAD_X, y);
+    tft.print(lines[i]);
+    y += (CHAR_H + 4);
+    if (y > BOX_Y + BOX_H - CHAR_H) break;
+  }
+
+  tft.setTextColor(ILI9341_WHITE);
+  lastGcodeDrawn = gcode;
+}
+
+// ---------- BT receive: parse X/Y updates ----------
+void processBTLine(const String& line) {
+  if (line.length() >= 2 && line.charAt(0) == 'X') {
+    int val = line.substring(1).toInt();
+    if (val != xPos) { xPos = val; drawStatusBar(true); }
+  } else if (line.length() >= 2 && line.charAt(0) == 'Y') {
+    int val = line.substring(1).toInt();
+    if (val != yPos) { yPos = val; drawStatusBar(true); }
+  }
+}
+
+void pollBTIncoming() {
+  while (BT.available()) {
+    char c = BT.read();
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      btInLine.trim();
+      if (btInLine.length() > 0) processBTLine(btInLine);
+      btInLine = "";
+    } else {
+      if (btInLine.length() < 32) btInLine += c;
+    }
+  }
+}
+
+// ---------- Setup / Loop ----------
+void setup() {
+  Serial.begin(9600);
+  BT.begin(9600);
+
+  pinMode(BT_STATE, INPUT);
+
+  pinMode(BTN_ORIGIN, INPUT_PULLUP);
+  pinMode(BTN_UP,     INPUT_PULLUP);
+  pinMode(BTN_DOWN,   INPUT_PULLUP);
+  pinMode(BTN_RIGHT,  INPUT_PULLUP);
+  pinMode(BTN_LEFT,   INPUT_PULLUP);
+  pinMode(BTN_MODE,   INPUT_PULLUP);
+
+  pinMode(53, OUTPUT);
+  digitalWrite(53, HIGH);
+
+  tft.begin();
+  tft.setRotation(4);
+
+  mode = MODE_BUTTONS;
+  drawButtonsScreen();
+  lastMode = mode;
+
+  sentUpHeld = sentDownHeld = sentRightHeld = sentLeftHeld = 0;
+  lastModeBtn = 0;
+}
+
+void loop() {
+  pollBTIncoming();
+  drawStatusBar(false);
+
+  // Toggle on pin 35 press edge
+  int modeBtn = (digitalRead(BTN_MODE) == LOW) ? 1 : 0;
+  if (modeBtn == 1 && lastModeBtn == 0) {
+    mode = (mode == MODE_BUTTONS) ? MODE_KEYPAD : MODE_BUTTONS;
+  }
+  lastModeBtn = modeBtn;
+
+  if (mode != lastMode) {
+    if (mode == MODE_BUTTONS) drawButtonsScreen();
+    else drawKeypadScreen();
+    lastMode = mode;
+
+    // release holds when entering keypad
+    if (mode == MODE_KEYPAD) {
+      if (sentUpHeld)    { sentUpHeld = 0; btSendLine("U0"); }
+      if (sentDownHeld)  { sentDownHeld = 0; btSendLine("D0"); }
+      if (sentRightHeld) { sentRightHeld = 0; btSendLine("R0"); }
+      if (sentLeftHeld)  { sentLeftHeld = 0; btSendLine("L0"); }
+    }
+  }
+
+  if (mode == MODE_BUTTONS) {
+    int originP = (digitalRead(BTN_ORIGIN) == LOW) ? 1 : 0;
+    int upP     = (digitalRead(BTN_UP)     == LOW) ? 1 : 0;
+    int downP   = (digitalRead(BTN_DOWN)   == LOW) ? 1 : 0;
+    int rightP  = (digitalRead(BTN_RIGHT)  == LOW) ? 1 : 0;
+    int leftP   = (digitalRead(BTN_LEFT)   == LOW) ? 1 : 0;
+
+    if (originP != lastOrigin) { lastOrigin = originP; draw01AtLine(0, originP); }
+    if (upP     != lastUp)     { lastUp     = upP;     draw01AtLine(1, upP); }
+    if (downP   != lastDown)   { lastDown   = downP;   draw01AtLine(2, downP); }
+    if (rightP  != lastRight)  { lastRight  = rightP;  draw01AtLine(3, rightP); }
+    if (leftP   != lastLeft)   { lastLeft   = leftP;   draw01AtLine(4, leftP); }
+
+    draw01AtLine(5, modeBtn);
+
+    if (originP)      drawPressedLabel("ORIGIN");
+    else if (upP)     drawPressedLabel("UP");
+    else if (downP)   drawPressedLabel("DOWN");
+    else if (rightP)  drawPressedLabel("RIGHT");
+    else if (leftP)   drawPressedLabel("LEFT");
+    else              drawPressedLabel("NONE");
+
+    // Origin sends once per press
+    static int lastOriginEdge = 0;
+    if (originP && !lastOriginEdge) btSendLine("O");
+    lastOriginEdge = originP;
+
+    // Hold commands X
+    if (upP != sentUpHeld) {
+      sentUpHeld = upP;
+      btSendLine(upP ? "U1" : "U0");
+    }
+    if (downP != sentDownHeld) {
+      sentDownHeld = downP;
+      btSendLine(downP ? "D1" : "D0");
+    }
+
+    // Hold commands Y
+    if (rightP != sentRightHeld) {
+      sentRightHeld = rightP;
+      btSendLine(rightP ? "R1" : "R0");
+    }
+    if (leftP != sentLeftHeld) {
+      sentLeftHeld = leftP;
+      btSendLine(leftP ? "L1" : "L0");
+    }
+
+  } else {
+    char k = keypad.getKey();
+    if (k) {
+      if (k == 'D') gcode = "";
+      else if (k == '#') gcode += '\n';
+      else if (k == 'A') {
+        if (gcode.length() > 0 && gcode[gcode.length() - 1] != '\n') gcode += '\n';
+        gcode += "G:";
+      } else gcode += k;
+      drawGcodeBoxIfChanged();
+    }
+  }
+
+  delay(15);
+}
