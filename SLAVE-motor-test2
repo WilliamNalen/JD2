@@ -1,0 +1,170 @@
+#include <SoftwareSerial.h>
+#include <Servo.h>
+
+#define BT_RX 11
+#define BT_TX 10
+SoftwareSerial BT(BT_RX, BT_TX);
+
+Servo sx;               // X axis servo
+Servo sy;               // Y axis servo
+#define SERVO_X_PIN 9
+#define SERVO_Y_PIN 8
+
+// ===== TUNING =====
+const int ORIGIN_POS = 90;
+const int MIN_POS = 0;
+const int MAX_POS = 180;
+
+const unsigned long INTERVAL_MS = 10; // step timing
+
+// Ramp tiers (hold duration -> step size)
+const unsigned long RAMP1_MS = 250;
+const unsigned long RAMP2_MS = 900;
+const int STEP1_DEG = 1;
+const int STEP2_DEG = 3;
+const int STEP3_DEG = 6;
+
+// Report position back to Mega
+const unsigned long REPORT_MS = 100;
+// ==================
+
+bool upHeld = false;     // X+
+bool downHeld = false;   // X-
+bool rightHeld = false;  // Y+
+bool leftHeld = false;   // Y-
+
+int xPos = ORIGIN_POS;
+int yPos = ORIGIN_POS;
+
+unsigned long lastStepMs = 0;
+
+int lastXDir = 0;
+unsigned long xHoldStartMs = 0;
+
+int lastYDir = 0;
+unsigned long yHoldStartMs = 0;
+
+unsigned long lastReportMs = 0;
+int lastReportedX = -999;
+int lastReportedY = -999;
+
+void clampWriteX() {
+  if (xPos < MIN_POS) xPos = MIN_POS;
+  if (xPos > MAX_POS) xPos = MAX_POS;
+  sx.write(xPos);
+}
+
+void clampWriteY() {
+  if (yPos < MIN_POS) yPos = MIN_POS;
+  if (yPos > MAX_POS) yPos = MAX_POS;
+  sy.write(yPos);
+}
+
+int stepForHold(unsigned long heldForMs) {
+  if (heldForMs < RAMP1_MS) return STEP1_DEG;
+  if (heldForMs < RAMP2_MS) return STEP2_DEG;
+  return STEP3_DEG;
+}
+
+void handleCmd(const String& line) {
+  if (line == "U1") { upHeld = true;  Serial.println("X UP = 1"); }
+  else if (line == "U0") { upHeld = false; Serial.println("X UP = 0"); }
+  else if (line == "D1") { downHeld = true; Serial.println("X DOWN = 1"); }
+  else if (line == "D0") { downHeld = false; Serial.println("X DOWN = 0"); }
+
+  else if (line == "R1") { rightHeld = true; Serial.println("Y RIGHT = 1"); }
+  else if (line == "R0") { rightHeld = false; Serial.println("Y RIGHT = 0"); }
+  else if (line == "L1") { leftHeld = true;  Serial.println("Y LEFT = 1"); }
+  else if (line == "L0") { leftHeld = false; Serial.println("Y LEFT = 0"); }
+
+  else if (line == "O")  {
+    xPos = ORIGIN_POS; yPos = ORIGIN_POS;
+    clampWriteX(); clampWriteY();
+    Serial.println("ORIGIN BOTH");
+  } else {
+    Serial.print("Unknown: ");
+    Serial.println(line);
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  BT.begin(9600);
+
+  sx.attach(SERVO_X_PIN);
+  sy.attach(SERVO_Y_PIN);
+  sx.write(xPos);
+  sy.write(yPos);
+
+  Serial.println("Nano ready: 2-axis ramp + X/Y report");
+}
+
+void loop() {
+  // Read commands
+  if (BT.available()) {
+    String line = BT.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) {
+      Serial.print("Received: ");
+      Serial.println(line);
+      handleCmd(line);
+    }
+  }
+
+  unsigned long now = millis();
+
+  // ----- X axis -----
+  int xDir = 0;
+  if (upHeld && !downHeld) xDir = 1;
+  else if (downHeld && !upHeld) xDir = -1;
+
+  if (xDir != lastXDir) {
+    lastXDir = xDir;
+    if (xDir != 0) xHoldStartMs = now;
+  }
+
+  // ----- Y axis -----
+  int yDir = 0;
+  if (rightHeld && !leftHeld) yDir = 1;
+  else if (leftHeld && !rightHeld) yDir = -1;
+
+  if (yDir != lastYDir) {
+    lastYDir = yDir;
+    if (yDir != 0) yHoldStartMs = now;
+  }
+
+  // Step both axes on shared interval
+  if (now - lastStepMs >= INTERVAL_MS) {
+    lastStepMs = now;
+
+    if (xDir != 0) {
+      int step = stepForHold(now - xHoldStartMs);
+      xPos += xDir * step;
+      clampWriteX();
+    }
+
+    if (yDir != 0) {
+      int step = stepForHold(now - yHoldStartMs);
+      yPos += yDir * step;
+      clampWriteY();
+    }
+  }
+
+  // Report back X and Y
+  if (now - lastReportMs >= REPORT_MS) {
+    lastReportMs = now;
+
+    if (xPos != lastReportedX) {
+      lastReportedX = xPos;
+      BT.print('X');
+      BT.println(xPos);
+      Serial.print("TX->Mega: X"); Serial.println(xPos);
+    }
+    if (yPos != lastReportedY) {
+      lastReportedY = yPos;
+      BT.print('Y');
+      BT.println(yPos);
+      Serial.print("TX->Mega: Y"); Serial.println(yPos);
+    }
+  }
+}
