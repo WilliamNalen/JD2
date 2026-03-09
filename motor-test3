@@ -1,0 +1,416 @@
+#include <Stepper.h>
+#include <math.h>
+#include <SoftwareSerial.h>
+
+#define STEPS_PER_REV 2048
+
+// ===== Bluetooth =====
+SoftwareSerial BT(2,3);   // Nano RX, TX
+
+// ===== E-STOP =====
+#define ESTOP_PIN 12
+
+// ===== Motors =====
+Stepper elbowMotor(STEPS_PER_REV,4,6,5,7);
+Stepper baseMotor (STEPS_PER_REV,8,10,9,11);
+
+// ===== Arm lengths =====
+const float L1 = 7.0;
+const float L2 = 5.0;
+
+const float STEP_ANGLE_DEG = 360.0 / STEPS_PER_REV;
+
+// ===== Startup pose =====
+const float HOME_BASE_DEG  = 180.0;
+const float HOME_ELBOW_DEG = 180.0;
+
+// ===== Direction / trim =====
+const int BASE_DIR_SIGN  = 1;
+const int ELBOW_DIR_SIGN = -1;
+
+float BASE_TRIM_DEG  = 0.0;
+float ELBOW_TRIM_DEG = 0.0;
+
+// ===== Speed =====
+const int BASE_RPM  = 10;
+const int ELBOW_RPM = 10;
+
+// ===== Motion =====
+const float SEGMENTS_PER_INCH = 5.0;
+const float HOLD_STEP_INCH = 0.25;
+
+// ===== Workspace =====
+const float USER_MIN_X = -5.0;
+const float USER_MAX_X =  5.0;
+const float USER_MIN_Y = -5.0;
+const float USER_MAX_Y =  5.0;
+
+// ===== Current position =====
+float currentBaseDeg  = HOME_BASE_DEG;
+float currentElbowDeg = HOME_ELBOW_DEG;
+
+float currentUserX = 5.0;
+float currentUserY = 0.0;
+
+// ===== Button states =====
+bool upHeld=false;
+bool downHeld=false;
+bool rightHeld=false;
+bool leftHeld=false;
+
+// ===== E-stop state =====
+bool estopActive = false;
+bool lastEstopPhysical = false;
+
+String btLine="";
+
+// =====================================================
+// Helpers
+// =====================================================
+
+float wrapDeg180(float a)
+{
+  while(a>180)a-=360;
+  while(a<-180)a+=360;
+  return a;
+}
+
+float shortestAngleDiffDeg(float target,float current)
+{
+  return wrapDeg180(target-current);
+}
+
+long angleDegToSteps(float deg)
+{
+  return lround(deg/STEP_ANGLE_DEG);
+}
+
+float clampf(float v,float lo,float hi)
+{
+  if(v<lo)return lo;
+  if(v>hi)return hi;
+  return v;
+}
+
+void userToReal(float ux,float uy,float &rx,float &ry)
+{
+  rx=ux-L1;
+  ry=uy;
+}
+
+void sendPosition()
+{
+  BT.print("X");
+  BT.println((int)round(currentUserX));
+
+  BT.print("Y");
+  BT.println((int)round(-currentUserY));
+}
+
+void sendEstopState()
+{
+  BT.print("ESTOP:");
+  BT.println(estopActive ? "ON" : "OFF");
+}
+
+bool estopPressedNow()
+{
+  return digitalRead(ESTOP_PIN) == LOW;
+}
+
+void pollEstopToggle()
+{
+  bool pressed = estopPressedNow();
+
+  // toggle on press edge
+  if (pressed && !lastEstopPhysical)
+  {
+    estopActive = !estopActive;
+
+    // clear held commands so it doesn't resume old motion
+    upHeld = false;
+    downHeld = false;
+    rightHeld = false;
+    leftHeld = false;
+
+    sendEstopState();
+  }
+
+  lastEstopPhysical = pressed;
+}
+
+// =====================================================
+// IK
+// =====================================================
+
+bool solveIKReal(float x,float y,float &baseDeg,float &elbowDeg)
+{
+  float d=sqrt(x*x+y*y);
+
+  if(d>(L1+L2))return false;
+  if(d<fabs(L1-L2))return false;
+
+  float c2=(x*x+y*y-L1*L1-L2*L2)/(2*L1*L2);
+  c2=clampf(c2,-1,1);
+
+  float s2=sqrt(1-c2*c2);
+
+  float t2a=atan2(+s2,c2);
+  float t1a=atan2(y,x)-atan2(L2*sin(t2a),L1+L2*cos(t2a));
+
+  float baseA=t1a*180/PI;
+  float elbowA=t2a*180/PI;
+
+  float t2b=atan2(-s2,c2);
+  float t1b=atan2(y,x)-atan2(L2*sin(t2b),L1+L2*cos(t2b));
+
+  float baseB=t1b*180/PI;
+  float elbowB=t2b*180/PI;
+
+  float costA=
+  fabs(shortestAngleDiffDeg(baseA,currentBaseDeg))+
+  fabs(shortestAngleDiffDeg(elbowA,currentElbowDeg));
+
+  float costB=
+  fabs(shortestAngleDiffDeg(baseB,currentBaseDeg))+
+  fabs(shortestAngleDiffDeg(elbowB,currentElbowDeg));
+
+  if(costA<=costB)
+  {
+    baseDeg=baseA;
+    elbowDeg=elbowA;
+  }
+  else
+  {
+    baseDeg=baseB;
+    elbowDeg=elbowB;
+  }
+
+  return true;
+}
+
+// =====================================================
+// Motor control
+// =====================================================
+
+bool moveJointDeltas(float db,float de)
+{
+  long baseSteps=angleDegToSteps(db);
+  long elbowSteps=angleDegToSteps(de);
+
+  long maxSteps=max(labs(baseSteps),labs(elbowSteps));
+  if(maxSteps==0)return true;
+
+  float baseInc=(float)baseSteps/maxSteps;
+  float elbowInc=(float)elbowSteps/maxSteps;
+
+  float baseAcc=0;
+  float elbowAcc=0;
+
+  for(long i=0;i<maxSteps;i++)
+  {
+    pollEstopToggle();
+    if(estopActive) return false;
+
+    baseAcc+=baseInc;
+    elbowAcc+=elbowInc;
+
+    if(fabs(baseAcc)>=1)
+    {
+      int dir=(baseAcc>0)?1:-1;
+      baseMotor.step(dir*BASE_DIR_SIGN);
+      baseAcc-=dir;
+    }
+
+    if(fabs(elbowAcc)>=1)
+    {
+      int dir=(elbowAcc>0)?1:-1;
+      elbowMotor.step(dir*ELBOW_DIR_SIGN);
+      elbowAcc-=dir;
+    }
+
+    delay(2);
+  }
+
+  return true;
+}
+
+bool moveToAnglesAbs(float b,float e)
+{
+  b+=BASE_TRIM_DEG;
+  e+=ELBOW_TRIM_DEG;
+
+  float db=shortestAngleDiffDeg(b,currentBaseDeg);
+  float de=shortestAngleDiffDeg(e,currentElbowDeg);
+
+  if(!moveJointDeltas(db,de)) return false;
+
+  currentBaseDeg=wrapDeg180(currentBaseDeg+db);
+  currentElbowDeg=wrapDeg180(currentElbowDeg+de);
+  return true;
+}
+
+bool moveLineUser(float x1,float y1,float x2,float y2)
+{
+  float dx=x2-x1;
+  float dy=y2-y1;
+
+  float dist=sqrt(dx*dx+dy*dy);
+
+  int segments=max(1,(int)ceil(dist*SEGMENTS_PER_INCH));
+
+  for(int i=1;i<=segments;i++)
+  {
+    pollEstopToggle();
+    if(estopActive) return false;
+
+    float t=(float)i/segments;
+
+    float ux=x1+dx*t;
+    float uy=y1+dy*t;
+
+    float rx,ry;
+    userToReal(ux,uy,rx,ry);
+
+    float baseDeg,elbowDeg;
+
+    if(!solveIKReal(rx,ry,baseDeg,elbowDeg))
+      return false;
+
+    if(!moveToAnglesAbs(baseDeg,elbowDeg))
+      return false;
+  }
+
+  currentUserX=x2;
+  currentUserY=y2;
+
+  sendPosition();
+
+  return true;
+}
+
+bool goToUser(float x,float y)
+{
+  if(estopActive) return false;
+  return moveLineUser(currentUserX,currentUserY,x,y);
+}
+
+// =====================================================
+// Movement from remote buttons
+// =====================================================
+
+void serviceHeldMovement()
+{
+  if(estopActive) return;
+
+  float targetX=currentUserX;
+  float targetY=currentUserY;
+
+  bool any=false;
+
+  // Pressing UP makes arm move up on your system
+  if(upHeld){targetY-=HOLD_STEP_INCH;any=true;}
+  if(downHeld){targetY+=HOLD_STEP_INCH;any=true;}
+  if(rightHeld){targetX+=HOLD_STEP_INCH;any=true;}
+  if(leftHeld){targetX-=HOLD_STEP_INCH;any=true;}
+
+  if(!any)return;
+
+  targetX=clampf(targetX,USER_MIN_X,USER_MAX_X);
+  targetY=clampf(targetY,USER_MIN_Y,USER_MAX_Y);
+
+  if(fabs(targetX-currentUserX)<0.0001 &&
+     fabs(targetY-currentUserY)<0.0001)
+     return;
+
+  goToUser(targetX,targetY);
+}
+
+// =====================================================
+// Bluetooth command parser
+// =====================================================
+
+void handleBTLine(String line)
+{
+  line.trim();
+  if(line.length()==0)return;
+
+  if(line=="P")
+  {
+    sendPosition();
+    sendEstopState();
+    return;
+  }
+
+  if(line=="O")
+  {
+    upHeld = false;
+    downHeld = false;
+    rightHeld = false;
+    leftHeld = false;
+
+    if(!estopActive) goToUser(0,0);
+    return;
+  }
+
+  if(line=="U1"){ if(!estopActive) upHeld=true; return; }
+  if(line=="U0"){ upHeld=false; return; }
+
+  if(line=="D1"){ if(!estopActive) downHeld=true; return; }
+  if(line=="D0"){ downHeld=false; return; }
+
+  if(line=="R1"){ if(!estopActive) rightHeld=true; return; }
+  if(line=="R0"){ rightHeld=false; return; }
+
+  if(line=="L1"){ if(!estopActive) leftHeld=true; return; }
+  if(line=="L0"){ leftHeld=false; return; }
+}
+
+void pollBT()
+{
+  while(BT.available())
+  {
+    char c=BT.read();
+
+    if(c=='\r')continue;
+
+    if(c=='\n')
+    {
+      handleBTLine(btLine);
+      btLine="";
+    }
+    else
+      btLine+=c;
+  }
+}
+
+// =====================================================
+// Setup / Loop
+// =====================================================
+
+void setup()
+{
+  Serial.begin(9600);
+  BT.begin(9600);
+
+  pinMode(ESTOP_PIN, INPUT_PULLUP);
+
+  baseMotor.setSpeed(BASE_RPM);
+  elbowMotor.setSpeed(ELBOW_RPM);
+
+  currentBaseDeg=HOME_BASE_DEG;
+  currentElbowDeg=HOME_ELBOW_DEG;
+
+  currentUserX=5;
+  currentUserY=0;
+
+  sendPosition();
+  sendEstopState();
+}
+
+void loop()
+{
+  pollEstopToggle();
+  pollBT();
+  serviceHeldMovement();
+} 
